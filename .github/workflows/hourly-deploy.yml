@@ -1,0 +1,80 @@
+# Hourly HeatShield refresh -> Hugging Face static Space.
+#
+# Every hour this job takes the latest code and trusted data from the team
+# repository (laiba2526/heatshield-pakistan, read-only), downloads fresh
+# Open-Meteo data, runs Quality Gate 1, the Data Quality Agent and Quality
+# Gate 2, and - only if both gates pass - publishes the new trusted data to
+# the Hugging Face Space. Nothing is ever written back to the team repository.
+#
+# Setup (once, in THIS repository): Settings -> Secrets and variables -> Actions
+#   secret   HF_TOKEN  = Hugging Face write token for the Space
+#   variable HF_SPACE  = NeuralPowerX/heatshield-pakistan   (optional, this is the default)
+name: hourly-deploy
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hourly-deploy
+  cancel-in-progress: false
+
+env:
+  TEAM_REPO: laiba2526/heatshield-pakistan
+  HF_SPACE: ${{ vars.HF_SPACE || 'NeuralPowerX/heatshield-pakistan' }}
+
+jobs:
+  refresh-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check the Hugging Face token is set
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::Add the HF_TOKEN secret in Settings -> Secrets and variables -> Actions"
+            exit 1
+          fi
+
+      - name: Get the team repository (code + trusted data)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TEAM_REPO }}
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: pip install -r requirements.txt huggingface_hub
+
+      - name: Refresh data with both quality gates
+        id: update
+        run: python run.py update
+
+      - name: Show the run result
+        if: always()
+        run: |
+          python - <<'EOF'
+          import json
+          s = json.load(open("data/status/run_status.json", encoding="utf-8"))
+          print("last run:", s.get("last_run_id"), s.get("last_run_status"), s.get("last_run_error") or "")
+          for city, f in (s.get("freshness") or {}).items():
+              print(f"{city}: latest observation {f.get('last_observation_utc')}, forecast issued {f.get('forecast_issued_utc')}")
+          EOF
+
+      - name: Publish trusted data to the Hugging Face Space
+        if: steps.update.outcome == 'success'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python run.py rag
+          python scripts/deploy_hf.py "$HF_SPACE"
